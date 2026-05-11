@@ -27,11 +27,14 @@ from lmcache.v1.gpu_connector.gpu_connectors import (
     VLLMPagedMemGPUConnectorV2,
 )
 from lmcache.v1.gpu_connector.utils import (
+    DiscoverableKVCache,
     LayoutHints,
     _get_head_size_view,
     _split_token2d_kv,
     get_block_size,
+    get_device,
     get_dtype,
+    get_group_data_ptrs,
     get_head_size,
     get_hidden_dim_size,
     get_num_blocks,
@@ -937,6 +940,10 @@ class SGLangXPUConnector(GPUConnectorInterface):
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
         self.use_xpu = use_xpu
+        # Host-side pointer metadata kept for CUDA parity and diagnostics.
+        # XPU SGLang transfer path uses torch index ops, not pointer kernels.
+        self.kv_cache_pointers_host = torch.empty(0, dtype=torch.int64, device="cpu")
+        self.page_buffer_size = 0
 
         self.gpu_buffer: Optional[torch.Tensor] = None
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
@@ -954,6 +961,48 @@ class SGLangXPUConnector(GPUConnectorInterface):
                 shape, dtype=kwargs["dtype"], device=kwargs["device"]
             )
             logger.info(f"XPU buffer: {self.gpu_buffer.shape}")
+
+    def _normalize_sglang_kvcaches(
+        self, kv_caches: DiscoverableKVCache
+    ) -> DiscoverableKVCache:
+        # Non-layerwise SGLang can register MHA caches as a flat list
+        # [k0, k1, ..., v0, v1, ...]. Convert to canonical [k_list, v_list]
+        # so format discovery and transfer logic can handle both layouts.
+        if (
+            not self.use_mla
+            and isinstance(kv_caches, list)
+            and len(kv_caches) == self.num_layers * 2
+            and all(isinstance(t, torch.Tensor) for t in kv_caches)
+        ):
+            return [kv_caches[: self.num_layers], kv_caches[self.num_layers :]]
+        return kv_caches
+
+    def _initialize_pointers(self, kv_caches: DiscoverableKVCache) -> DiscoverableKVCache:
+        normalized_kv_caches = self._normalize_sglang_kvcaches(kv_caches)
+        self.gpu_kv_format, normalized_kv_caches = normalize_kv_and_discover_format(
+            normalized_kv_caches, EngineType.SGLANG
+        )
+
+        num_layers = get_num_layers(normalized_kv_caches, self.gpu_kv_format)
+        ptrs = get_group_data_ptrs(
+            normalized_kv_caches, self.gpu_kv_format, list(range(num_layers))
+        )
+        expected_ptrs = self.num_layers if is_mla(self.gpu_kv_format) else self.num_layers * 2
+        assert len(ptrs) == expected_ptrs, (
+            f"Expected {expected_ptrs} KV cache pointers, got {len(ptrs)}"
+        )
+        if self.kv_cache_pointers_host.shape[0] != len(ptrs):
+            self.kv_cache_pointers_host = torch.empty(
+                len(ptrs), dtype=torch.int64, device="cpu"
+            )
+        self.kv_cache_pointers_host.numpy()[:] = ptrs
+
+        device = get_device(normalized_kv_caches)
+        assert device.type == "xpu", "The device should be XPU."
+        self.page_buffer_size = get_page_buffer_size(
+            normalized_kv_caches, self.gpu_kv_format
+        )
+        return normalized_kv_caches
 
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         assert memory_obj.tensor is not None
@@ -977,13 +1026,13 @@ class SGLangXPUConnector(GPUConnectorInterface):
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
         offset = kwargs.get("offset", 0)
-        kvcaches = kwargs["kvcaches"]
+        kvcaches = self._initialize_pointers(kwargs["kvcaches"])
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start - offset : end - offset]
 
         data = memory_obj.tensor.to(slices.device)
 
-        if self.use_mla:
+        if is_mla(self.gpu_kv_format):
             # MLA: kvcaches is List[tensor_per_layer], each [P, 1, head_size]
             # data shape: [num_layers, num_tokens, hidden_dim]
             for layer_id in range(self.num_layers):
@@ -1010,11 +1059,11 @@ class SGLangXPUConnector(GPUConnectorInterface):
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        kvcaches = kwargs["kvcaches"]
+        kvcaches = self._initialize_pointers(kwargs["kvcaches"])
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
 
-        if self.use_mla:
+        if is_mla(self.gpu_kv_format):
             # MLA: kvcaches is List[tensor_per_layer], each [P, 1, head_size]
             layers = []
             for layer_id in range(self.num_layers):
@@ -1152,11 +1201,11 @@ class SGLangLayerwiseXPUConnector(GPUConnectorInterface):
 
                     max_slot = sl.max().item()
                     if max_slot >= t:
-                        logger.warning(
+                        raise ValueError(
                             f"Layer {layer_id}: slot index {max_slot} >= "
-                            f"cache size {t}, clamping"
+                            f"cache size {t}"
                         )
-                        sl = sl.clamp(max=t - 1)
+
 
                     cache.view(t, h_d).index_copy_(0, sl, data)
             else:
@@ -1190,11 +1239,10 @@ class SGLangLayerwiseXPUConnector(GPUConnectorInterface):
 
                     max_slot = sl.max().item()
                     if max_slot >= t:
-                        logger.warning(
+                        raise ValueError(
                             f"Layer {layer_id}: slot index {max_slot} >= "
-                            f"cache size {t}, clamping"
+                            f"cache size {t}"
                         )
-                        sl = sl.clamp(max=t - 1)
 
                     k_cache.view(t, h_d).index_copy_(0, sl, k_data)
                     v_cache.view(t, h_d).index_copy_(0, sl, v_data)

@@ -67,6 +67,15 @@ def _zero_kvcaches(kvcaches, use_mla):
                 t.zero_()
 
 
+def _as_flat_sglang_mha(kvcaches):
+    """Convert [[k_list], [v_list]] to flat [k0, ..., kN, v0, ..., vN]."""
+    return list(kvcaches[0]) + list(kvcaches[1])
+
+
+def _flat_to_nested_sglang_mha(kvcaches_flat, num_layers: int):
+    return [kvcaches_flat[:num_layers], kvcaches_flat[num_layers:]]
+
+
 # --------------------------------------------------------------------------- #
 # Non-layerwise (SGLangXPUConnector)
 # --------------------------------------------------------------------------- #
@@ -150,6 +159,92 @@ def test_sglang_xpu_connector_roundtrip(use_xpu: bool, use_mla: bool):
         _check_kv_equal(
             kvcaches, kvcaches_dst, slot_mapping,
             num_heads=num_heads, head_size=head_size, use_mla=use_mla,
+        )
+    finally:
+        memobj.ref_count_down()
+        pin_alloc.close()
+
+
+@pytest.mark.parametrize("use_xpu", [False, True])
+def test_sglang_xpu_connector_roundtrip_flat_mha_kvcaches(use_xpu: bool):
+    """Non-layerwise SGLang can pass flat MHA kvcaches; ensure roundtrip works."""
+    _skip_if_no_xpu()
+    device = torch.device("xpu:0")
+
+    num_layers = 2
+    num_blocks = 4
+    block_size = 16
+    num_heads = 8
+    head_size = 64
+    num_tokens = 32
+    hidden_dim = num_heads * head_size
+
+    nested_src = generate_sglang_kv_cache_paged_list_tensors(
+        num_layers=num_layers,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_heads=num_heads,
+        head_size=head_size,
+        use_mla=False,
+        device=device,
+    )
+    kvcaches_src = _as_flat_sglang_mha(nested_src)
+
+    total_slots = num_blocks * block_size
+    slot_mapping = _make_unique_slot_mapping(
+        total_slots=total_slots, num_tokens=num_tokens, device=device
+    )
+
+    conn = SGLangXPUConnector(
+        hidden_dim_size=hidden_dim,
+        num_layers=num_layers,
+        use_xpu=use_xpu,
+        chunk_size=num_tokens,
+        dtype=torch.bfloat16,
+        device=device,
+        use_mla=False,
+    )
+
+    pin_alloc = PinMemoryAllocator(size=1024 * 1024 * 64)
+    memobj = pin_alloc.allocate(conn.get_shape(num_tokens), torch.bfloat16, MemoryFormat.KV_2LTD)
+
+    try:
+        conn.from_gpu(
+            memobj,
+            start=0,
+            end=num_tokens,
+            slot_mapping=slot_mapping,
+            kvcaches=kvcaches_src,
+        )
+
+        nested_dst = generate_sglang_kv_cache_paged_list_tensors(
+            num_layers=num_layers,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_heads=num_heads,
+            head_size=head_size,
+            use_mla=False,
+            device=device,
+        )
+        kvcaches_dst = _as_flat_sglang_mha(nested_dst)
+        for t in kvcaches_dst:
+            t.zero_()
+
+        conn.to_gpu(
+            memobj,
+            start=0,
+            end=num_tokens,
+            slot_mapping=slot_mapping,
+            kvcaches=kvcaches_dst,
+        )
+
+        _check_kv_equal(
+            _flat_to_nested_sglang_mha(kvcaches_src, num_layers),
+            _flat_to_nested_sglang_mha(kvcaches_dst, num_layers),
+            slot_mapping,
+            num_heads=num_heads,
+            head_size=head_size,
+            use_mla=False,
         )
     finally:
         memobj.ref_count_down()

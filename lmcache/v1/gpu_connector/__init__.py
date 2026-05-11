@@ -36,16 +36,17 @@ def CreateGPUConnector(
         local_worker_id = metadata.local_worker_id
         kv_dtype = metadata.kv_dtype
 
-        # Detect device type
+        # Detect device type based on actual available devices
         dev_name = "cuda"
         try:
-            if torch.xpu.is_available():
-                dev_name = "xpu"
-        except AttributeError:
+            # Try to set XPU device - if successful, use XPU
+            torch.xpu.set_device(local_worker_id)
+            dev_name = "xpu"
+        except (AttributeError, RuntimeError):
+            # If XPU is not available or device setup fails, fall back to CUDA
             pass
 
         if dev_name == "xpu":
-            torch.xpu.set_device(local_worker_id)
             device = torch.device(f"xpu:{local_worker_id}")
 
             # First Party
