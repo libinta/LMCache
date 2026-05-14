@@ -928,7 +928,7 @@ class VLLMPagedMemLayerwiseXPUConnector(GPUConnectorInterface):
 class SGLangXPUConnector(GPUConnectorInterface):
     """
     SGLang GPU KV connector for XPU devices.
-    
+
     Extends the base connector interface with XPU-specific device handling
     and synchronization using torch.xpu instead of torch.cuda.
     """
@@ -1092,7 +1092,7 @@ class SGLangXPUConnector(GPUConnectorInterface):
 class SGLangLayerwiseXPUConnector(GPUConnectorInterface):
     """
     SGLang layerwise GPU KV connector for XPU devices.
-    
+
     Supports layerwise loading/storing with XPU-specific device handling.
     """
 
@@ -1148,16 +1148,136 @@ class SGLangLayerwiseXPUConnector(GPUConnectorInterface):
         return self.kv_cache_pointers_on_gpu[idx]
 
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        raise NotImplementedError
+        raise NotImplementedError(
+            "SGLangLayerwiseXPUConnector uses the batched_to_gpu generator."
+        )
 
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        raise NotImplementedError
+        raise NotImplementedError(
+            "SGLangLayerwiseXPUConnector uses the batched_from_gpu generator."
+        )
 
-    def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
-        raise NotImplementedError
+    @_lmcache_nvtx_annotate
+    def batched_to_gpu(self, starts: List[int], ends: List[int], **kwargs):
+        """
+        Generator: CPU token2d -> XPU paged KV (per layer).
 
-    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
-        raise NotImplementedError
+        Protocol (called by cache_engine):
+          next()               -- initial call, setup and pause at first layer yield
+          send(mem_objs_layer) -- per-layer: receive memory objects, do H2D, advance
+          next()               -- final call, synchronize
+
+        In total yields num_layers + 1 times.
+        """
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+        if "sync" not in kwargs:
+            raise ValueError("'sync' should be provided in kwargs.")
+
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        for layer_id in range(self.num_layers):
+            memory_objs_layer = yield
+
+            k_layer = self.kvcaches[0][layer_id]  # [total_slots, head_num, head_size]
+            v_layer = self.kvcaches[1][layer_id]
+
+            total_slots = k_layer.shape[0]
+            d = k_layer.shape[1] * k_layer.shape[2]
+
+            for s, e, mem in zip(starts, ends, memory_objs_layer, strict=False):
+                assert mem.tensor is not None
+                sl = slot_mapping[s:e].to(self.device)
+                k_tok, v_tok = _split_token2d_kv(mem.tensor.to(self.device))
+                k_layer.view(total_slots, d).index_copy_(
+                    0, sl, k_tok.reshape(e - s, d)
+                )
+                v_layer.view(total_slots, d).index_copy_(
+                    0, sl, v_tok.reshape(e - s, d)
+                )
+
+            logger.debug(f"Finished loading layer {layer_id}")
+
+        yield  # final synchronization yield
+
+    @_lmcache_nvtx_annotate
+    def batched_from_gpu(
+        self,
+        memory_objs: List[List[MemoryObj]],
+        starts: List[int],
+        ends: List[int],
+        **kwargs,
+    ):
+        """
+        Generator: XPU paged KV -> CPU token2d (per layer).
+
+        Protocol (called by cache_engine):
+          next()   -- initial call, setup and pause
+          next()   -- per-layer: trigger D2H for that layer, pause
+                      (caller then batched_puts memory_objs[layer_id])
+
+        In total yields num_layers + 1 times.
+        """
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+        if "sync" not in kwargs:
+            raise ValueError("'sync' should be provided in kwargs.")
+
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        yield  # initial yield after first next()
+
+        for layer_id in range(self.num_layers):
+            mem_layer = memory_objs[layer_id]
+
+            k_layer = self.kvcaches[0][layer_id]  # [total_slots, head_num, head_size]
+            v_layer = self.kvcaches[1][layer_id]
+
+            total_slots = k_layer.shape[0]
+            d = k_layer.shape[1] * k_layer.shape[2]
+
+            offset = 0
+            for s, e, mem in zip(starts, ends, mem_layer, strict=False):
+                assert mem.tensor is not None
+                sl = slot_mapping[s:e].to(self.device)
+                n = e - s
+
+                k_chunk = k_layer.view(total_slots, d).index_select(0, sl)  # [n, d]
+                v_chunk = v_layer.view(total_slots, d).index_select(0, sl)  # [n, d]
+
+                # Write back into the KV_T2D memory object
+                if mem.tensor.shape[0] == 2:  # [2, T, D]
+                    mem.tensor[0].copy_(
+                        k_chunk.reshape(n, -1).to(mem.tensor.device), non_blocking=True
+                    )
+                    mem.tensor[1].copy_(
+                        v_chunk.reshape(n, -1).to(mem.tensor.device), non_blocking=True
+                    )
+                elif mem.tensor.shape[1] == 2:  # [T, 2, D]
+                    mem.tensor[:, 0, :].copy_(
+                        k_chunk.reshape(n, -1).to(mem.tensor.device), non_blocking=True
+                    )
+                    mem.tensor[:, 1, :].copy_(
+                        v_chunk.reshape(n, -1).to(mem.tensor.device), non_blocking=True
+                    )
+                else:
+                    raise ValueError(
+                        f"Unexpected memory object tensor format: {mem.tensor.shape}"
+                    )
+                offset += n
+
+            yield  # yield after each layer, caller batched_puts memory_objs[layer_id]
+            logger.debug(f"Finished offloading layer {layer_id}")
+
+        yield  # final yield
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         return torch.Size([2, self.num_layers, num_tokens, self.hidden_dim_size])

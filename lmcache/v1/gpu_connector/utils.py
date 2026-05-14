@@ -171,6 +171,8 @@ def assert_layerwise_gpu_connector(gpu_connector: "GPUConnectorInterface"):
     )
     from lmcache.v1.gpu_connector.xpu_connectors import (
         VLLMPagedMemLayerwiseXPUConnector,
+        SGLangLayerwiseXPUConnector,
+        SGLangXPUConnector,
     )
 
     assert isinstance(
@@ -180,6 +182,8 @@ def assert_layerwise_gpu_connector(gpu_connector: "GPUConnectorInterface"):
             VLLMBufferLayerwiseGPUConnector,
             SGLangLayerwiseGPUConnector,
             VLLMPagedMemLayerwiseXPUConnector,
+            SGLangLayerwiseXPUConnector,
+            SGLangXPUConnector,
         ),
     )
 
