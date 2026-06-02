@@ -190,17 +190,41 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
         vllm_cached = kwargs.get("vllm_cached_tokens", 0)
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
-        lmc_ops.multi_layer_kv_transfer(
-            memory_obj.tensor,
-            kv_cache_pointers,
-            slot_mapping[start:end],
-            self.device,
-            self.page_buffer_size,
-            lmc_ops.TransferDirection.H2D,
-            self.gpu_kv_format,
-            self.block_size,
-            skip_prefix_n_tokens,
-        )
+        # NOTE (XPU): mirror the staging logic of from_gpu(). Level Zero
+        # does not allow a compute kernel to read from a plain host
+        # pointer, so when memory_obj.tensor lives on host we must stage
+        # it through the on-device gpu_buffer first. The direct path is
+        # only safe when the chunk is larger than the staging buffer (in
+        # which case no sub-slice can fit) or when no gpu_buffer exists
+        # (the use_gpu=False configuration, which is skipped on XPU).
+        if self.gpu_buffer is None or end - start > self.gpu_buffer.shape[2]:
+            lmc_ops.multi_layer_kv_transfer(
+                memory_obj.tensor,
+                kv_cache_pointers,
+                slot_mapping[start:end],
+                self.device,
+                self.page_buffer_size,
+                lmc_ops.TransferDirection.H2D,
+                self.gpu_kv_format,
+                self.block_size,
+                skip_prefix_n_tokens,
+            )
+        else:
+            # memobj (host) -> gpu_buffer -> kvcaches (XPU)
+            assert self.gpu_buffer.device == self.device
+            tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
+            tmp_gpu_buffer.copy_(memory_obj.tensor, non_blocking=True)
+            lmc_ops.multi_layer_kv_transfer(
+                tmp_gpu_buffer,
+                kv_cache_pointers,
+                slot_mapping[start:end],
+                self.device,
+                self.page_buffer_size,
+                lmc_ops.TransferDirection.H2D,
+                self.gpu_kv_format,
+                self.block_size,
+                skip_prefix_n_tokens,
+            )
 
     @_lmcache_nvtx_annotate
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -236,7 +260,16 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
         with torch.xpu.stream(self.store_stream):
-            if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
+            # NOTE: The direct (non-staged) path uses
+            # lmc_ops.multi_layer_kv_transfer to write XPU memory straight
+            # into a pinned host buffer. Level Zero does not allow a
+            # compute kernel to touch plain host pointers, so it surfaces
+            # UR_RESULT_ERROR_DEVICE_LOST. We only take that path when no
+            # gpu_buffer exists, or when the chunk is *larger* than the
+            # staging buffer (in which case no sub-slice can fit). Partial
+            # chunks (end - start < gpu_buffer.shape[2]) still slice into
+            # the staging buffer below.
+            if self.gpu_buffer is None or end - start > self.gpu_buffer.shape[2]:
                 lmc_ops.multi_layer_kv_transfer(
                     memory_obj.tensor,
                     kv_cache_pointers,
@@ -1354,15 +1387,33 @@ class SGLangXPUConnector(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
         kv_cache_pointers = self._initialize_pointers(kvcaches)
-        lmc_ops.multi_layer_kv_transfer_unilateral(
-            memory_obj.tensor,
-            kv_cache_pointers,
-            slot_mapping[start - offset : end - offset],
-            kvcaches[0][0].device,
-            self.page_buffer_size,
-            lmc_ops.TransferDirection.H2D,
-            self.gpu_kv_format,
-        )
+        # NOTE (XPU): mirror from_gpu's staging logic. Level Zero cannot
+        # have a kernel read from a plain host pointer, so when a
+        # gpu_buffer exists and the chunk fits, stage memory_obj.tensor
+        # through it (host -> gpu_buffer -> kvcaches).
+        if self.gpu_buffer is None or end - start > self.gpu_buffer.shape[2]:
+            lmc_ops.multi_layer_kv_transfer_unilateral(
+                memory_obj.tensor,
+                kv_cache_pointers,
+                slot_mapping[start - offset : end - offset],
+                kvcaches[0][0].device,
+                self.page_buffer_size,
+                lmc_ops.TransferDirection.H2D,
+                self.gpu_kv_format,
+            )
+        else:
+            assert self.gpu_buffer.device == kvcaches[0][0].device
+            tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
+            tmp_gpu_buffer.copy_(memory_obj.tensor, non_blocking=True)
+            lmc_ops.multi_layer_kv_transfer_unilateral(
+                tmp_gpu_buffer,
+                kv_cache_pointers,
+                slot_mapping[start - offset : end - offset],
+                kvcaches[0][0].device,
+                self.page_buffer_size,
+                lmc_ops.TransferDirection.H2D,
+                self.gpu_kv_format,
+            )
 
     @_lmcache_nvtx_annotate
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -1396,7 +1447,16 @@ class SGLangXPUConnector(GPUConnectorInterface):
 
         kv_cache_pointers = self._initialize_pointers(kvcaches)
 
-        if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
+        # NOTE: The direct (non-staged) path uses
+        # lmc_ops.multi_layer_kv_transfer_unilateral to write XPU memory
+        # straight into a pinned host buffer. Level Zero does not allow a
+        # compute kernel to touch plain host pointers, so it surfaces
+        # UR_RESULT_ERROR_DEVICE_LOST. We only take that path when no
+        # gpu_buffer exists, or when the chunk is *larger* than the
+        # staging buffer (in which case no sub-slice can fit). Partial
+        # chunks (end - start < gpu_buffer.shape[2]) still slice into the
+        # staging buffer below.
+        if self.gpu_buffer is None or end - start > self.gpu_buffer.shape[2]:
             lmc_ops.multi_layer_kv_transfer_unilateral(
                 memory_obj.tensor,
                 kv_cache_pointers,
