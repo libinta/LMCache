@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# Standard
+import os
+
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
@@ -22,10 +25,14 @@ def lmcache_get_config(config_file: str = "") -> LMCacheEngineConfig:
     Returns:
         A validated ``LMCacheEngineConfig``.
     """
-    if config_file:
-        logger.info(f"Loading LMCache config file {config_file}")
-        config = LMCacheEngineConfig.from_file(config_file)
+    resolved_config_file = config_file or os.getenv("LMCACHE_CONFIG_FILE", "")
+
+    if resolved_config_file:
+        logger.info(f"Loading LMCache config file {resolved_config_file}")
+        config = LMCacheEngineConfig.from_file(resolved_config_file)
+        # Keep precedence aligned with other integrations: env overrides file.
+        config.update_config_from_env()
     else:
-        config = LMCacheEngineConfig.from_defaults()
+        config = LMCacheEngineConfig.from_env()
     config.validate()
     return config

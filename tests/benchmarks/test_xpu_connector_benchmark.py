@@ -34,6 +34,18 @@ def _skip_if_no_xpu() -> None:
         pytest.skip("torch.xpu is not available")
 
 
+def _skip_if_xpu_without_gpu_buffer(device_type: str, use_gpu: bool) -> None:
+    """Skip combos that require running the XPU transfer kernel against a
+    plain host pointer. Level Zero forbids it (UR_RESULT_ERROR_DEVICE_LOST),
+    and once a single test trips it the device stays dead for the rest of
+    the pytest process, cascading every subsequent test into failure."""
+    if device_type == "xpu" and not use_gpu:
+        pytest.skip(
+            "XPU connector requires use_gpu=True (Level Zero cannot run the "
+            "transfer kernel against host memory)"
+        )
+
+
 def _device_from_type(device_type: str) -> torch.device:
     if device_type == "xpu":
         return torch.device("xpu")
@@ -225,6 +237,7 @@ def test_store_1gb_v2(
     autorelease_v1,
 ):
     _skip_if_no_xpu()
+    _skip_if_xpu_without_gpu_buffer(device_type, use_gpu)
 
     num_heads = 8
     head_dim = 128
@@ -316,6 +329,7 @@ def test_retrieve_1gb_allhit_v2(
     autorelease_v1,
 ):
     _skip_if_no_xpu()
+    _skip_if_xpu_without_gpu_buffer(device_type, use_gpu)
 
     num_heads = 8
     head_dim = 128
@@ -410,6 +424,7 @@ def test_lookup_20k_tokens_v2(
     autorelease_v1,
 ):
     _skip_if_no_xpu()
+    _skip_if_xpu_without_gpu_buffer(device_type, use_gpu)
 
     num_heads = 8
     head_dim = 128

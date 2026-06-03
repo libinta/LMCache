@@ -102,6 +102,12 @@ def init_lmcache_engine(
         mock_up_broadcast_object_fn,
     )
 
+    logger.info(
+        "SGLang LMCache engine ready: use_layerwise=%s, gpu_connector=%s",
+        engine.config.use_layerwise,
+        type(engine.gpu_connector).__name__ if engine.gpu_connector is not None else None,
+    )
+
     return engine
 
 
