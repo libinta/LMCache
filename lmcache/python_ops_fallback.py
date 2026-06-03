@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 
 # Store the tensor objects in memory so that they can be accessed
 # outside the scope of this file
@@ -353,8 +353,17 @@ def _alloc_page_aligned_pinned_view(size: int) -> Tuple[torch.Tensor, int]:
     slices the aligned region out. The slice shares storage with the
     backing tensor, so keeping the slice alive keeps the underlying
     memory alive (no need to track the backing tensor separately).
+
+    On XPU we request ``pin_memory=True`` so the backing storage is
+    allocated via the SYCL USM-host path (``urUSMHostAlloc``), which lets
+    subsequent ``aten::copy_`` D2H transfers take the direct-DMA path
+    instead of falling back to a pageable bounce-buffer copy (the latter
+    regressed ~2.8x on intel-opencl-icd 26.14 for ~10 MB transfers).
     """
-    backing = torch.empty(size + _PAGE_SIZE, dtype=torch.uint8, pin_memory=False)
+    use_pin = torch_device_type == "xpu" and torch_dev.is_available()
+    backing = torch.empty(
+        size + _PAGE_SIZE, dtype=torch.uint8, pin_memory=use_pin
+    )
     # First-touch initialization on the entire backing region
     backing.fill_(0)
     base = backing.data_ptr()
