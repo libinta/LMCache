@@ -383,12 +383,21 @@ def _alloc_page_aligned_pinned_view(size: int) -> Tuple[torch.Tensor, int]:
     instead of falling back to a pageable bounce-buffer copy (the latter
     regressed ~2.8x on intel-opencl-icd 26.14 for ~10 MB transfers).
     """
-    use_pin = torch_device_type == "xpu" and torch_dev.is_available()
+    disable_xpu_pinned = os.environ.get(
+        "LMCACHE_XPU_DISABLE_PINNED_HOST_ALLOC", "0"
+    ) == "1"
+    use_pin = (
+        torch_device_type == "xpu"
+        and torch_dev.is_available()
+        and not disable_xpu_pinned
+    )
     backing = torch.empty(
         size + _PAGE_SIZE, dtype=torch.uint8, pin_memory=use_pin
     )
-    # First-touch initialization on the entire backing region
-    backing.fill_(0)
+    # Do not first-touch pinned XPU host memory here. In some driver/runtime
+    # combinations this eager fill can crash in the scalar fill kernel.
+    if not use_pin:
+        backing.fill_(0)
     base = backing.data_ptr()
     # Distance from `base` to the next page boundary (0..PAGE_SIZE-1).
     offset = (-base) % _PAGE_SIZE
